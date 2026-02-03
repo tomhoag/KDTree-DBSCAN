@@ -14,6 +14,8 @@
  */
 
 import KDTree
+import SwiftUI
+
 
 public struct DBSCAN<Value: Equatable & Hashable & KDTreePoint> {
     private class Point: Equatable {
@@ -52,10 +54,12 @@ public struct DBSCAN<Value: Equatable & Hashable & KDTreePoint> {
 
     /// Creates a new clustering algorithm with the specified values.
     /// - Parameter values: The values to be clustered.
-    public init(_ values: [Value]) {
+    public init(_ values: [Value], useKDTree: Bool = true) {
         self.values = values
+        if useKDTree {
+            kdtree = KDTree(values: values)
+        }
     }
-
 
     /**
      Clusters values according to the specified parameters.
@@ -74,92 +78,140 @@ public struct DBSCAN<Value: Equatable & Hashable & KDTreePoint> {
     public func callAsFunction(epsilon: Double, minimumNumberOfPoints: Int, distanceFunction: (Value, Value) throws -> Double) rethrows -> (clusters: [[Value]], outliers: [Value]) {
         precondition(minimumNumberOfPoints >= 0)
 
-        let points = values.map { Point($0) }
+        let n = values.count
+        guard n > 0 else { return ([], []) }
 
+        // labels per index (nil = unlabeled)
+        var labels = Array<Int?>(repeating: nil, count: n)
         var currentLabel = 0
-        for point in points {
-            guard point.label == nil else { continue }
 
-            var neighbors = try points.filter { try distanceFunction(point.value, $0.value) < epsilon }
+        for i in 0..<n {
+            if labels[i] != nil { continue }
+
+            // find initial neighbors (indices) of i
+            var neighbors: [Int] = []
+            neighbors.reserveCapacity(16)
+            for j in 0..<n {
+                if try distanceFunction(values[i], values[j]) < epsilon {
+                    neighbors.append(j)
+                }
+            }
+
             if neighbors.count >= minimumNumberOfPoints {
                 defer { currentLabel += 1 }
-                point.label = currentLabel
+                labels[i] = currentLabel
 
-                while !neighbors.isEmpty {
-                    let neighbor = neighbors.removeFirst()
-                    guard neighbor.label == nil else { continue }
+                // index-based queue with head pointer to avoid O(n) removeFirst()
+                var queue = neighbors
+                var head = 0
 
-                    neighbor.label = currentLabel
+                while head < queue.count {
+                    let neighborIndex = queue[head]; head += 1
 
-                    let n1 = try points.filter { try distanceFunction(neighbor.value, $0.value) < epsilon }
+                    if labels[neighborIndex] != nil { continue }
+
+                    labels[neighborIndex] = currentLabel
+
+                    // find neighbors of neighborIndex
+                    var n1: [Int] = []
+                    n1.reserveCapacity(8)
+                    for j in 0..<n {
+                        if try distanceFunction(values[neighborIndex], values[j]) < epsilon {
+                            n1.append(j)
+                        }
+                    }
+
                     if n1.count >= minimumNumberOfPoints {
-                        neighbors.append(contentsOf: n1)
+                        queue.append(contentsOf: n1)
                     }
                 }
             }
         }
 
-        var clusters: [[Value]] = []
+        // Build clusters and outliers from labels
+        var clustersDict: [Int: [Value]] = [:]
+        clustersDict.reserveCapacity(currentLabel)
         var outliers: [Value] = []
+        outliers.reserveCapacity(n / 10)
 
-        for (label, points) in Dictionary(grouping: points, by: { $0.label }) {
-            let values = points.map { $0.value }
-            if label == nil {
-                outliers.append(contentsOf: values)
+        for (idx, v) in values.enumerated() {
+            if let lbl = labels[idx] {
+                clustersDict[lbl, default: []].append(v)
             } else {
-                clusters.append(values)
+                outliers.append(v)
             }
         }
 
+        let clusters = clustersDict.keys.sorted().map { clustersDict[$0]! }
         return (clusters, outliers)
     }
 
-    public func callAsFunction(epsilon: Double, minimumNumberOfPoints: Int) -> (clusters: [[Value]], outliers: [Value]){
+    public func callAsFunction(epsilon: Double, minimumNumberOfPoints: Int) -> (clusters: [[Value]], outliers: [Value]) {
         precondition(minimumNumberOfPoints >= 0)
         precondition(kdtree != nil, "KDTree must be initialized")
 
-        let points = values.map { Point($0) }
-        // Build O(1) lookup from Value -> Point
-        let pointByValue: [Value: Point] = Dictionary(uniqueKeysWithValues: points.map { ($0.value, $0) })
+        let tree = kdtree! // local strong reference
+        let n = values.count
+        guard n > 0 else { return ([], []) }
+
+        // labels per index (nil = unlabeled)
+        var labels = Array<Int?>(repeating: nil, count: n)
+
+        // Map Value -> index for O(1) conversions from KDTree results to indices
+        let valueToIndex: [Value: Int] = Dictionary(uniqueKeysWithValues: values.enumerated().map { ($1, $0) })
 
         var currentLabel = 0
-        for point in points {
-            guard point.label == nil else { continue }
 
-            let neighborValues = kdtree!.allPoints(within: epsilon, of: point.value)
-            var neighbors = neighborValues.compactMap { pointByValue[$0] }
+        // Work through each point by index
+        for i in 0..<n {
+            if labels[i] != nil { continue }
+
+            // initial neighbors as indices
+            let neighborValues = tree.allPoints(within: epsilon, of: values[i])
+            var neighbors = neighborValues.compactMap { valueToIndex[$0] }
 
             if neighbors.count >= minimumNumberOfPoints {
                 defer { currentLabel += 1 }
-                point.label = currentLabel
+                labels[i] = currentLabel
 
-                while !neighbors.isEmpty {
-                    let neighbor = neighbors.removeFirst()
-                    guard neighbor.label == nil else { continue }
+                // Use an index-based queue (head pointer) to avoid O(n) removeFirst
+                var queue = neighbors
+                var head = 0
 
-                    neighbor.label = currentLabel
+                while head < queue.count {
+                    let neighborIndex = queue[head]
+                    head += 1
 
-                    let n1Values = kdtree!.allPoints(within: epsilon, of: neighbor.value)
-                    var n1 = n1Values.compactMap { pointByValue[$0] }
+                    if labels[neighborIndex] != nil { continue }
+
+                    labels[neighborIndex] = currentLabel
+
+                    let n1Values = tree.allPoints(within: epsilon, of: values[neighborIndex])
+                    let n1 = n1Values.compactMap { valueToIndex[$0] }
+
                     if n1.count >= minimumNumberOfPoints {
-                        neighbors.append(contentsOf: n1)
+                        queue.append(contentsOf: n1)
                     }
                 }
             }
         }
 
-        var clusters: [[Value]] = []
+        // Build clusters and outliers from labels
+        var clustersDict: [Int: [Value]] = [:]
+        clustersDict.reserveCapacity(currentLabel)
         var outliers: [Value] = []
+        outliers.reserveCapacity(n / 10)
 
-        for (label, points) in Dictionary(grouping: points, by: { $0.label }) {
-            let values = points.map { $0.value }
-            if label == nil {
-                outliers.append(contentsOf: values)
+        for (idx, v) in values.enumerated() {
+            if let lbl = labels[idx] {
+                clustersDict[lbl, default: []].append(v)
             } else {
-                clusters.append(values)
+                outliers.append(v)
             }
         }
 
+        // Return clusters in label order
+        let clusters = clustersDict.keys.sorted().map { clustersDict[$0]! }
         return (clusters, outliers)
     }
 }
